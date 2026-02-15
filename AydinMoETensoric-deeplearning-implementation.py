@@ -4,69 +4,64 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 import time
 
-# --- 1. AYDIN CONFIG (Sistemin Kalbi) ---
+# --- 1. AYDIN CONFIG ---
 @dataclass
 class AydinConfig:
     hidden_dim: int = 512
     intermediate_dim: int = 1024
-    num_experts: int = 8      # Tek tensörde 8 uzman
-    top_k: int = 2            # Her token için 2 aktif uzman
+    num_experts: int = 8      # Toplam uzman sayısı
+    top_k: int = 2            # Her token için aktifleşecek uzman sayısı
     dropout: float = 0.1
 
 # --- 2. TENSORIC ENGINE: The Vectorized Expert Layer ---
 class TensoricSwiGLU(nn.Module):
     """
-    Pythonic DEĞİL, Tensoric!
-    Uzmanları döngüyle gezmek yerine, ağırlıkları (Experts, In, Out) şeklinde
-    3 boyutlu tensörlerde tutar ve 'gather' ile işlem yapar.
+    Python döngüleri yerine Tensor indexing kullanarak çalışan
+    vektörize edilmiş MoE katmanı.
     """
     def __init__(self, config: AydinConfig):
         super().__init__()
-        self.hidden_dim = config.hidden_dim
-        self.inter_dim = config.intermediate_dim
-        self.num_experts = config.num_experts
+        self.config = config
         
-        # Tüm uzmanların ağırlıkları tek bir devasa tensörde!
-        # Shape: (Num_Experts, Hidden_Dim, Intermediate_Dim * 2) -> Gate + Up projeksiyonları birleşik
+        # Tüm uzmanların ağırlıkları devasa tensörlerde tutulur.
+        # w13: Gate ve Up projeksiyonları birleşik (Fused)
         self.w13 = nn.Parameter(torch.empty(config.num_experts, config.hidden_dim, config.intermediate_dim * 2))
         
-        # Shape: (Num_Experts, Intermediate_Dim, Hidden_Dim) -> Down projeksiyonu
+        # w2: Down projeksiyonu
         self.w2 = nn.Parameter(torch.empty(config.num_experts, config.intermediate_dim, config.hidden_dim))
         
         self.reset_parameters()
 
     def reset_parameters(self):
-        # Xavier/Kaiming yerine basit normal init (Hız için)
-        nn.init.normal_(self.w13, std=0.02)
-        nn.init.normal_(self.w2, std=0.02)
+        # Ağırlıkları güvenli başlat (std=0.02)
+        nn.init.normal_(self.w13, mean=0.0, std=0.02)
+        nn.init.normal_(self.w2, mean=0.0, std=0.02)
 
     def forward(self, x: torch.Tensor, expert_indices: torch.Tensor) -> torch.Tensor:
         """
         x: (Batch, Seq, Hidden)
-        expert_indices: (Batch, Seq, TopK) -> Router'dan gelen indeksler
+        expert_indices: (Batch, Seq, TopK)
         """
+        B, S, H = x.shape
+        K = self.config.top_k
+        
         # 1. Ağırlık Seçimi (Weight Gathering)
-        # Bu adım sihirli: Her token için gerekli olan uzman matrislerini "çekiyoruz".
-        # w13 shape: (E, H, 2*I) -> Seçilen: (B, S, TopK, H, 2*I)
-        # Bu işlem GPU belleğinde bant genişliği ister ama hesaplamayı %100 vektörize eder.
-        selected_w13 = self.w13[expert_indices] 
+        # UYARI: VRAM kullanımı yüksektir. 
+        # (B, S, K, H, 2*I) boyutunda tensör oluşturur.
+        w13_selected = self.w13[expert_indices] 
         
-        # 2. Vektörize Matris Çarpımı (Input Projection)
-        # x'i (B, S, 1, 1, H) yaparak boyutları hizalıyoruz.
-        # Sonuç: (B, S, TopK, 1, 2*I)
-        x_expanded = x.unsqueeze(2).unsqueeze(2)
-        h13 = torch.matmul(x_expanded, selected_w13) 
+        # 2. Vektörize Matris Çarpımı
+        x_expanded = x.view(B, S, 1, 1, H)
+        h13 = torch.matmul(x_expanded, w13_selected)
         
-        # 3. SwiGLU Aktivasyonu (Fused)
-        # Split gate & up
-        gate, up = h13.split(self.inter_dim, dim=-1)
-        h_inter = F.silu(gate) * up # (B, S, TopK, 1, I)
+        # 3. SwiGLU Aktivasyonu
+        gate, up = h13.split(self.config.intermediate_dim, dim=-1)
+        h_inter = F.silu(gate) * up 
         
-        # 4. Down Projection (Çıkış)
-        selected_w2 = self.w2[expert_indices] # (B, S, TopK, I, H)
-        out = torch.matmul(h_inter, selected_w2) # (B, S, TopK, 1, H)
+        # 4. Down Projection
+        w2_selected = self.w2[expert_indices] 
+        out = torch.matmul(h_inter, w2_selected) 
         
-        # Gereksiz boyutları at: (B, S, TopK, H)
         return out.squeeze(-2)
 
 # --- 3. ARCHITECT: AydinMoE "Tensoric" Edition ---
@@ -74,95 +69,87 @@ class AydinMoETensoric(nn.Module):
     def __init__(self, config: AydinConfig):
         super().__init__()
         self.config = config
-        
-        # Router (Hala basit bir Linear katman, ama hızlı)
         self.router = nn.Linear(config.hidden_dim, config.num_experts, bias=False)
-        
-        # Tek bir devasa modül (Liste yok!)
         self.experts = TensoricSwiGLU(config)
 
     def forward(self, x: torch.Tensor):
-        # x: (Batch, Seq, Hidden)
-        
         # --- 1. ROUTING ---
         router_logits = self.router(x)
         routing_probs = F.softmax(router_logits, dim=-1)
         
-        # Top-K seçimi (Indices ve Weights)
-        # indices: (B, S, K), weights: (B, S, K)
+        # Top-K
         weights, indices = torch.topk(routing_probs, self.config.top_k, dim=-1)
         
-        # Normalize weights
-        weights = weights / weights.sum(dim=-1, keepdim=True)
+        # Normalize weights (Sıfıra bölme hatasını önlemek için +1e-6 ekledik)
+        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)
         
         # --- 2. TENSORIC COMPUTATION ---
-        # Döngü yok, stream yok. Sadece saf matematik.
-        # expert_output: (B, S, TopK, H)
         expert_output = self.experts(x, indices)
         
         # --- 3. WEIGHTED COMBINATION ---
-        # Her uzmanın çıktısını router ağırlığı ile çarp:
-        # weights.unsqueeze(-1) -> (B, S, K, 1)
         weighted_output = expert_output * weights.unsqueeze(-1)
-        
-        # Topla (Reduce over TopK dimension) -> (B, S, H)
         final_output = weighted_output.sum(dim=2)
         
         return final_output
 
-# --- 4. THE COMPILER SETUP (Şlak Diye Yapıştırma Bölümü) ---
+# --- 4. THE COMPILER SETUP ---
 def get_compiled_model():
+    if not torch.cuda.is_available():
+        raise RuntimeError("Bu kod NVIDIA GPU gerektirir!")
+
     conf = AydinConfig()
-    model = AydinMoETensoric(conf).cuda().to(dtype=torch.bfloat16) # bfloat16 candır
+    # Modeli GPU'ya at ve bfloat16 yap
+    model = AydinMoETensoric(conf).cuda().to(dtype=torch.bfloat16)
     
-    # NVIDIA GPU'larda Tensor Core'ları zorla
     torch.set_float32_matmul_precision('high')
     
-    print("🚀 Model derleniyor (torch.compile)... İlk çalıştırma biraz sürebilir.")
-    # mode="max-autotune": Triton kernel'larını en dibine kadar optimize eder.
-    # fullgraph=True: Graph break (grafik kopması) istemiyoruz!
+    print("🚀 Model derleniyor (torch.compile)...")
     compiled_model = torch.compile(model, mode="max-autotune")
     
     return compiled_model
 
 # --- 5. BENCHMARK ---
 if __name__ == "__main__":
-    if not torch.cuda.is_available():
-        print("Bu kod sadece NVIDIA GPU ile gerçek gücünü gösterir!")
-        exit()
-
-    model = get_compiled_model()
-    
-    # Dummy Data (Büyük Batch)
-    # (32 Batch, 128 Seq, 512 Hidden)
-    x = torch.randn(32, 128, 512, device="cuda", dtype=torch.bfloat16)
-    
-    # 1. Warmup (Derleme burada gerçekleşir)
-    print("🔥 Isınıyor (Compiling kernels)...")
-    start = time.time()
-    for _ in range(3):
-        _ = model(x)
-    print(f"Isınma Bitti: {time.time() - start:.2f} sn (Derleme dahil)")
-
-    # 2. Hız Testi
-    print("\n⚡ BENCHMARK BAŞLIYOR (1000 iterasyon) ⚡")
-    
-    torch.cuda.synchronize()
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    
-    start_event.record()
-    
-    # Hiçbir Python döngüsü GPU'yu bekletmesin diye graph capture kullanabiliriz 
-    # ama şimdilik saf compile performansına bakalım.
-    for _ in range(1000):
-        _ = model(x)
+    try:
+        model = get_compiled_model()
         
-    end_event.record()
-    torch.cuda.synchronize()
-    
-    elapsed_ms = start_event.elapsed_time(end_event)
-    print(f"Toplam Süre: {elapsed_ms:.2f} ms")
-    print(f"İterasyon Başına: {elapsed_ms/1000:.3f} ms")
-    print("\nSonuç: Bu mimari statiktir. torch.compile tüm uzman hesaplamalarını")
-    print("tek bir 'fused kernel' haline getirir. Google mühendisleri bunu beğendi. 😎")
+        # Bellek hatası almamak için Batch Size 16 seçildi.
+        # RTX 3090/4090 varsa 32 yapabilirsin.
+        BATCH_SIZE = 16 
+        SEQ_LEN = 128
+        HIDDEN_DIM = 512
+        
+        x = torch.randn(BATCH_SIZE, SEQ_LEN, HIDDEN_DIM, device="cuda", dtype=torch.bfloat16)
+        
+        print(f"📊 Veri Boyutu: [{BATCH_SIZE}, {SEQ_LEN}, {HIDDEN_DIM}]")
+        
+        # Warmup
+        print("🔥 Isınıyor...")
+        start = time.time()
+        for _ in range(3):
+            _ = model(x)
+        print(f"✅ Isınma Bitti: {time.time() - start:.2f} sn")
+
+        # Benchmark
+        ITERATIONS = 1000
+        print(f"\n⚡ BENCHMARK ({ITERATIONS} iterasyon) ⚡")
+        
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        torch.cuda.synchronize()
+        start_event.record()
+        
+        for _ in range(ITERATIONS):
+            _ = model(x)
+            
+        end_event.record()
+        torch.cuda.synchronize()
+        
+        elapsed_ms = start_event.elapsed_time(end_event)
+        print(f"⏱️  Toplam Süre: {elapsed_ms:.2f} ms")
+        print(f"🚀 İterasyon Başına: {elapsed_ms/ITERATIONS:.3f} ms")
+        
+    except Exception as e:
+        print(f"\n❌ HATA: {e}")
+        print("⚠️  'Out of memory' hatası ise BATCH_SIZE değişkenini küçültün (örn: 8).")
